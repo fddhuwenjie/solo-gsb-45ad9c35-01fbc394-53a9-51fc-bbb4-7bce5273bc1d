@@ -784,5 +784,298 @@ class CloseToleranceTest(unittest.TestCase):
         self.assertFalse(close(-1e30, NEG))
 
 
+class DecisionHttpTest(unittest.TestCase):
+    """端到端：并列最优人工定案的提交、原子性、过期保护与清除。
+
+    需要 Flask；无 Flask 的最小环境自动跳过（Docker 镜像内必跑）。
+    """
+
+    def setUp(self):
+        try:
+            import flask  # noqa: F401
+        except ImportError:
+            self.skipTest("未安装 Flask，端到端用例在 Docker 内运行")
+        import tempfile
+        from pathlib import Path
+        from app import db as dbmod
+        self._tmp = tempfile.TemporaryDirectory()
+        self._orig_db_path = dbmod.DB_PATH
+        dbmod.DB_PATH = Path(self._tmp.name) / "t.db"
+        dbmod.init_db()
+        from app.routes import app
+        self.client = app.test_client()
+
+    def tearDown(self):
+        from app import db as dbmod
+        dbmod.DB_PATH = self._orig_db_path
+        if hasattr(self, "_tmp"):
+            self._tmp.cleanup()
+
+    def _hole(self, name, n):
+        layers = [
+            {"top": i * 2.0, "bottom": (i + 1) * 2.0,
+             "lithology": "砂岩", "grain": "中粒", "water": "稍湿",
+             "confidence": 0.9}
+            for i in range(n)
+        ]
+        resp = self.client.post("/api/boreholes", json={
+            "name": name, "collar_elev": 100, "x": 0 if name == "R" else 10,
+            "layers": layers})
+        self.assertEqual(resp.status_code, 201, resp.data)
+        return resp.get_json()["id"]
+
+    def _setup_tie(self):
+        """2 参考层 / 1 待校核层、全零权重、gap_open=1e20：2 个并列归属。"""
+        rid = self._hole("R", 2)
+        hid = self._hole("H", 1)
+        self.client.put("/api/settings", json={
+            "weights": {"lithology": 0, "grain": 0, "water": 0,
+                        "elev": 0, "confidence": 0},
+            "gap_open": 1e20, "gap_extend": 1})
+        res = self.client.post(
+            "/api/correlate",
+            json={"reference_id": rid, "marker_ids": []}).get_json()
+        h = res["holes"][0]
+        self.assertEqual(h["solution_count"], 2)
+        self.assertEqual(h["solutions_listed"], 2)
+        return rid, hid, res
+
+    def test_fresh_run_has_no_decisions(self):
+        _rid, _hid, res = self._setup_tie()
+        self.assertIn("run_id", res)
+        h = res["holes"][0]
+        self.assertIsNone(h["decision"])
+        self.assertEqual(h["effective"]["source"], "auto")
+
+    def test_submit_choice_shown_as_manual_without_altering_metrics(self):
+        _rid, hid, res = self._setup_tie()
+        run_id = res["run_id"]
+        resp = self.client.post("/api/decisions", json={
+            "run_id": run_id,
+            "choices": [{"hole_id": hid, "solution_index": 1}]})
+        self.assertEqual(resp.status_code, 200, resp.data)
+        h = resp.get_json()["holes"][0]
+        self.assertEqual(h["decision"]["solution_index"], 1)
+        self.assertEqual(h["effective"]["source"], "manual")
+        # 定案匹配对等于所选并列方案
+        sol = h["tie_solutions"][1]
+        self.assertEqual(
+            sorted((p["ref_layer_id"], p["hole_layer_id"])
+                   for p in h["decision"]["pairs"]),
+            sorted(tuple(x) for x in sol["pairs"]))
+        # 未匹配层随之切换
+        self.assertEqual(
+            sorted(u["layer_id"] for u in h["effective"]["unmatched_ref"]),
+            sorted(sol["unmatched_ref"]))
+        # 算法分数 / 并列计数 / 歧义区间不改写
+        self.assertEqual(h["solution_count"], 2)
+        self.assertEqual(h["solutions_listed"], 2)
+        self.assertEqual(h["dp_score"], -1e20)
+        self.assertEqual(len(h["ambiguities"]), 2)
+        # 自动主解字段保持原样（与所选方案不同时仍展示原主解）
+        auto_pairs = sorted((p["ref_layer_id"], p["hole_layer_id"])
+                            for p in h["pairs"])
+        manual_pairs = sorted((p["ref_layer_id"], p["hole_layer_id"])
+                              for p in h["effective"]["pairs"])
+        self.assertNotEqual(auto_pairs, manual_pairs)
+        # 刷新页面（/api/state）后定案仍在
+        st = self.client.get("/api/state").get_json()
+        sh = st["result"]["holes"][0]
+        self.assertEqual(sh["decision"]["solution_index"], 1)
+        self.assertEqual(sh["effective"]["source"], "manual")
+
+    def test_export_contains_finalization(self):
+        _rid, hid, res = self._setup_tie()
+        self.client.post("/api/decisions", json={
+            "run_id": res["run_id"],
+            "choices": [{"hole_id": hid, "solution_index": 1}]})
+        body = self.client.get("/api/export").get_json()
+        eh = body["last_result"]["holes"][0]
+        self.assertEqual(eh["decision"]["solution_index"], 1)
+        self.assertEqual(eh["effective"]["source"], "manual")
+
+    def test_atomicity_invalid_choice_rejects_whole_batch(self):
+        rid, hid, res = self._setup_tie()
+        hid2 = self._hole("H2", 1)
+        res = self.client.post(
+            "/api/correlate",
+            json={"reference_id": rid, "marker_ids": []}).get_json()
+        # 第二口孔下标越界：整批 409，第一口也不落库
+        resp = self.client.post("/api/decisions", json={
+            "run_id": res["run_id"], "choices": [
+                {"hole_id": hid, "solution_index": 0},
+                {"hole_id": hid2, "solution_index": 9}]})
+        self.assertEqual(resp.status_code, 409)
+        st = self.client.get("/api/state").get_json()["result"]
+        self.assertTrue(all(h["decision"] is None for h in st["holes"]))
+
+    def test_non_tie_hole_and_bad_index_rejected(self):
+        _rid, hid, res = self._setup_tie()
+        resp = self.client.post("/api/decisions", json={
+            "run_id": res["run_id"],
+            "choices": [{"hole_id": hid, "solution_index": 5}]})
+        self.assertEqual(resp.status_code, 409)
+        # 唯一解孔（参考孔本身不在结果孔里；用 1x1 场景另验）见 test_*:
+        # 这里直接给不存在的孔 -> 409
+        resp = self.client.post("/api/decisions", json={
+            "run_id": res["run_id"],
+            "choices": [{"hole_id": 99999, "solution_index": 0}]})
+        self.assertEqual(resp.status_code, 409)
+
+    def test_stale_run_cannot_write_back_after_recalc(self):
+        _rid, hid, res = self._setup_tie()
+        old_run = res["run_id"]
+        # 重新计算 -> 新 run，旧定案（无）及旧页面代次全部失效
+        new_res = self.client.post(
+            "/api/correlate",
+            json={"reference_id": _rid, "marker_ids": []}).get_json()
+        self.assertNotEqual(old_run, new_res["run_id"])
+        self.assertTrue(all(h["decision"] is None for h in new_res["holes"]))
+        resp = self.client.post("/api/decisions", json={
+            "run_id": old_run,
+            "choices": [{"hole_id": hid, "solution_index": 0}]})
+        self.assertEqual(resp.status_code, 409)
+        self.assertTrue(all(
+            h["decision"] is None
+            for h in self.client.get("/api/state").get_json()["result"]["holes"]))
+
+    def test_stale_after_settings_or_layer_change(self):
+        rid, hid, res = self._setup_tie()
+        self.client.post("/api/decisions", json={
+            "run_id": res["run_id"],
+            "choices": [{"hole_id": hid, "solution_index": 1}]})
+        # 参数变化：结果失效
+        self.client.put("/api/settings", json={"gap_open": 5.0})
+        self.assertIsNone(self.client.get("/api/state").get_json()["result"])
+        resp = self.client.post("/api/decisions", json={
+            "run_id": res["run_id"],
+            "choices": [{"hole_id": hid, "solution_index": 0}]})
+        self.assertEqual(resp.status_code, 409)
+        # 层段变化同样失效
+        self.client.post("/api/correlate",
+                         json={"reference_id": rid, "marker_ids": []})
+        self.client.put("/api/settings", json={"gap_open": 1e20})
+        res2 = self.client.post(
+            "/api/correlate",
+            json={"reference_id": rid, "marker_ids": []}).get_json()
+        self.client.post("/api/decisions", json={
+            "run_id": res2["run_id"],
+            "choices": [{"hole_id": hid, "solution_index": 1}]})
+        rhole = next(b for b in self.client.get("/api/state").get_json()
+                     ["boreholes"] if b["id"] == rid)
+        self.client.put(f"/api/boreholes/{rid}", json={"layers": rhole["layers"]})
+        self.assertIsNone(self.client.get("/api/state").get_json()["result"])
+        resp = self.client.post("/api/decisions", json={
+            "run_id": res2["run_id"],
+            "choices": [{"hole_id": hid, "solution_index": 0}]})
+        self.assertEqual(resp.status_code, 409)
+
+    def test_clear_decisions_restores_primary(self):
+        _rid, hid, res = self._setup_tie()
+        self.client.post("/api/decisions", json={
+            "run_id": res["run_id"],
+            "choices": [{"hole_id": hid, "solution_index": 1}]})
+        resp = self.client.delete("/api/decisions", json={"run_id": res["run_id"]})
+        self.assertEqual(resp.status_code, 200)
+        h = resp.get_json()["holes"][0]
+        self.assertIsNone(h["decision"])
+        self.assertEqual(h["effective"]["source"], "auto")
+        # 过期页面清除被拒
+        self.client.post("/api/decisions", json={
+            "run_id": res["run_id"],
+            "choices": [{"hole_id": hid, "solution_index": 1}]})
+        resp = self.client.delete("/api/decisions", json={"run_id": "stale"})
+        self.assertEqual(resp.status_code, 409)
+        st = self.client.get("/api/state").get_json()["result"]["holes"][0]
+        self.assertIsNotNone(st["decision"])
+
+    def test_batch_two_holes_and_single_hole_clear(self):
+        rid, hid, _ = self._setup_tie()
+        hid2 = self._hole("H2", 1)
+        res = self.client.post(
+            "/api/correlate",
+            json={"reference_id": rid, "marker_ids": []}).get_json()
+        resp = self.client.post("/api/decisions", json={
+            "run_id": res["run_id"], "choices": [
+                {"hole_id": hid, "solution_index": 0},
+                {"hole_id": hid2, "solution_index": 1}]})
+        self.assertEqual(resp.status_code, 200, resp.data)
+        decided = {h["hole_id"]: h["decision"]["solution_index"]
+                   for h in resp.get_json()["holes"]}
+        self.assertEqual(decided[hid], 0)
+        self.assertEqual(decided[hid2], 1)
+        # 只清除一口
+        resp = self.client.delete("/api/decisions", json={
+            "run_id": res["run_id"], "hole_ids": [hid]})
+        after = {h["hole_id"]: h["decision"] for h in resp.get_json()["holes"]}
+        self.assertIsNone(after[hid])
+        self.assertIsNotNone(after[hid2])
+
+    def test_null_solution_index_cancels_in_batch(self):
+        """批次中 solution_index=null 表示取消该孔定案（恢复自动主解）。"""
+        _rid, hid, res = self._setup_tie()
+        self.client.post("/api/decisions", json={
+            "run_id": res["run_id"],
+            "choices": [{"hole_id": hid, "solution_index": 1}]})
+        # 与另一口新孔合批：本孔 null 取消、另一口定案，整批成功
+        hid2 = self._hole("H2", 1)
+        res = self.client.post(
+            "/api/correlate",
+            json={"reference_id": _rid, "marker_ids": []}).get_json()
+        resp = self.client.post("/api/decisions", json={
+            "run_id": res["run_id"], "choices": [
+                {"hole_id": hid, "solution_index": None},
+                {"hole_id": hid2, "solution_index": 0}]})
+        self.assertEqual(resp.status_code, 200, resp.data)
+        out = {h["hole_id"]: h for h in resp.get_json()["holes"]}
+        self.assertIsNone(out[hid]["decision"])
+        self.assertEqual(out[hid]["effective"]["source"], "auto")
+        self.assertEqual(out[hid2]["decision"]["solution_index"], 0)
+
+
+class BuildChoiceTest(unittest.TestCase):
+    """build_choice：把任一并列归属构造成与主解同构的定案展示体。"""
+
+    def test_build_choice_matches_tie_solution(self):
+        from app.correlator import build_choice
+        ref = make_layers([(101, "砂岩"), (102, "砂岩")])
+        hole = make_layers([(201, "砂岩")])
+        res = correlate(ref, hole, [], ZERO_WEIGHTS, 5.0, 1e20, 1.0)
+        for sol in res["tie_solutions"]:
+            view = build_choice(
+                ref, hole, [tuple(p) for p in sol["pairs"]],
+                sol["unmatched_ref"], sol["unmatched_hole"],
+                set(), ZERO_WEIGHTS, 5.0)
+            self.assertEqual(
+                sorted((p["ref_layer_id"], p["hole_layer_id"])
+                       for p in view["pairs"]),
+                sorted(tuple(x) for x in sol["pairs"]))
+            self.assertEqual(
+                [u["layer_id"] for u in view["unmatched_ref"]],
+                sol["unmatched_ref"])
+            self.assertEqual(
+                [u["layer_id"] for u in view["unmatched_hole"]],
+                sol["unmatched_hole"])
+            # 展示体字段与主解匹配对同构
+            for p in view["pairs"]:
+                self.assertIn("detail", p)
+                self.assertFalse(p["marker"])
+                self.assertEqual(p["score"], 0.0)
+
+    def test_build_choice_marks_anchors(self):
+        from app.correlator import build_choice
+        ref = make_layers([(101, "砂岩"), (102, "煤层")])
+        hole = make_layers([(201, "砂岩"), (202, "煤层")])
+        res = correlate(ref, hole, [(1, 1)], ZERO_WEIGHTS, 5.0, 1e20, 1e20)
+        sol = res["tie_solutions"][0]
+        view = build_choice(
+            ref, hole, [tuple(p) for p in sol["pairs"]],
+            sol["unmatched_ref"], sol["unmatched_hole"],
+            {(102, 202)}, ZERO_WEIGHTS, 5.0)
+        anchors = {(p["ref_layer_id"], p["hole_layer_id"])
+                   for p in view["pairs"] if p["marker"]}
+        self.assertEqual(anchors, {(102, 202)})
+
+
 if __name__ == "__main__":
     unittest.main()

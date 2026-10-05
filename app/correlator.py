@@ -726,3 +726,54 @@ def _layer_brief(ly):
         "bottom": ly["bottom"],
         "zmid": round(ly["zmid"], 3),
     }
+
+
+def build_choice(ref_layers, hole_layers, pairs, unmatched_ref_ids,
+                 unmatched_hole_ids, marker_pair_ids, weights, elev_scale):
+    """按一个选定的归属（来自 tie_solutions）构造定案展示体。
+
+    pairs: [(ref_layer_id, hole_layer_id), ...]，顺序即并列方案中的顺序；
+    unmatched_*_ids: 两侧未匹配层 id 列表（顺序即方案给出的顺序）。
+    返回与 correlate() 主解同构的 {"pairs", "unmatched_ref",
+    "unmatched_hole"}，供人工定案在剖面连线与导出 JSON 中使用。
+    marker_pair_ids: 锁定锚点匹配对 id 集合，命中则标记 marker=True。
+    """
+    ref_by_id = {ly["id"]: ly for ly in ref_layers}
+    hole_by_id = {ly["id"]: ly for ly in hole_layers}
+    n = len(ref_layers)
+    denom = max(n, len(hole_layers), 1)
+    missing = [rid for rid, _ in pairs if rid not in ref_by_id] + \
+              [hid for _, hid in pairs if hid not in hole_by_id] + \
+              [i for i in unmatched_ref_ids if i not in ref_by_id] + \
+              [i for i in unmatched_hole_ids if i not in hole_by_id]
+    if missing:
+        raise KeyError(f"定案引用了当前计算中不存在的层：{sorted(set(missing))}")
+    out_pairs = []
+    for rid, hid in pairs:
+        ra, hb = ref_by_id[rid], hole_by_id[hid]
+        s, det = pair_similarity(ra, hb, weights, elev_scale)
+        out_pairs.append({
+            "ref_layer_id": rid,
+            "hole_layer_id": hid,
+            "ref_seq": ra["seq"],
+            "hole_seq": hb["seq"],
+            "ref_lithology": ra["lithology"],
+            "hole_lithology": hb["lithology"],
+            "ref_zm": ra["zmid"],
+            "hole_zm": hb["zmid"],
+            "elev_delta": ra["zmid"] - hb["zmid"],
+            "score": round(s, 4),
+            "detail": {k: round(v, 4) for k, v in det.items()},
+            "marker": (rid, hid) in marker_pair_ids,
+        })
+    out_pairs.sort(key=lambda p: p["ref_seq"])
+    unref = [_layer_brief(ref_by_id[i]) for i in unmatched_ref_ids]
+    unhole = [_layer_brief(hole_by_id[i]) for i in unmatched_hole_ids]
+    return {
+        "pairs": out_pairs,
+        "unmatched_ref": unref,
+        "unmatched_hole": unhole,
+        "sum_similarity": round(sum(p["score"] for p in out_pairs), 4),
+        "total_score": round(
+            100.0 * sum(p["score"] for p in out_pairs) / denom, 2),
+    }

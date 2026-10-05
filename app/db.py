@@ -48,7 +48,19 @@ CREATE TABLE IF NOT EXISTS settings (
 CREATE TABLE IF NOT EXISTS run_result (
     id      INTEGER PRIMARY KEY CHECK (id = 1),
     payload TEXT,
-    generated_at TEXT
+    generated_at TEXT,
+    run_id  TEXT
+);
+
+-- 人工定案：只从属于某次计算（run_id）；重新计算 / 层段 / 标志层 / 参数
+-- 变化后 run_result 换新 run_id 并清空本表，旧定案不再挂到任何结果上。
+CREATE TABLE IF NOT EXISTS decision (
+    run_id         TEXT    NOT NULL,
+    hole_id        INTEGER NOT NULL,
+    solution_index INTEGER NOT NULL,          -- 选定 tie_solutions 的下标
+    payload        TEXT    NOT NULL,          -- 定案展示体（匹配对/未匹配层全量明细）
+    decided_at     TEXT,
+    PRIMARY KEY (run_id, hole_id)
 );
 """
 
@@ -78,6 +90,10 @@ def init_db():
     conn = get_db()
     try:
         conn.executescript(SCHEMA)
+        # 旧库迁移：run_result 增加 run_id（历史结果没有定案代次标识）
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(run_result)")}
+        if "run_id" not in cols:
+            conn.execute("ALTER TABLE run_result ADD COLUMN run_id TEXT")
         import json
         row = conn.execute("SELECT payload FROM settings WHERE id = 1").fetchone()
         if row is None:

@@ -164,6 +164,15 @@ button:disabled { opacity: .45; cursor: not-allowed; }
 .tag.amb { background: #f4ecf7; color: var(--amb); }
 .tag.warn { background: #fdecea; color: var(--danger); }
 .tag.unm { background: #f2f2f2; color: var(--ink-2); }
+.tag.manual { background: #e3f3ea; color: var(--ok); }
+.tag.auto { background: #eef4f6; color: var(--primary-d); }
+.tag.pending { background: #fff4df; color: #9a6a08; }
+.head-tag { margin-left: 6px; font-weight: 400; }
+.result-hole.decided { border-color: var(--ok); box-shadow: 0 0 0 1px var(--ok) inset; }
+.decide-bar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin: 6px 0; }
+.decide-bar .hint { flex: 1 1 100%; margin: 0; }
+.decide-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.decide-row select { padding: 3px 6px; border: 1px solid var(--line); border-radius: 5px; font: inherit; }
 .result-hole-body .line { margin: 3px 0; }
 .linkbtn { color: var(--primary); cursor: pointer; text-decoration: underline; }
 
@@ -212,8 +221,10 @@ button:disabled { opacity: .45; cursor: not-allowed; }
 .marker-link-row select { flex: 1; padding: 5px 7px; border: 1px solid var(--line); border-radius: 5px; font: inherit; }
 
 .tie-item { border: 1px solid var(--line); border-radius: 7px; padding: 8px 10px; margin-bottom: 8px; font-size: 12.5px; }
+.tie-item.chosen { border-color: var(--ok); box-shadow: 0 0 0 1px var(--ok) inset; }
 .tie-item .th { display: flex; justify-content: space-between; font-weight: 600; margin-bottom: 4px; }
 .tie-item .pairs { display: flex; flex-wrap: wrap; gap: 4px; }
+.tie-item .choose-sol { margin-top: 6px; }
 .tie-pill { background: #eef4f6; border-radius: 4px; padding: 1px 7px; }
 .tie-pill.anchor { background: #fbe7d3; }
 .tie-item .un { color: var(--ink-2); margin-top: 4px; }
@@ -236,7 +247,9 @@ button:disabled { opacity: .45; cursor: not-allowed; }
 .corr-line { fill: none; stroke: var(--primary); stroke-width: 1.6; opacity: .85; }
 .corr-line.anchor { stroke: var(--accent); stroke-width: 2.4; }
 .corr-line.ambiguous { stroke: var(--amb); stroke-dasharray: 5 3; stroke-width: 1.8; }
+.corr-line.manual { stroke: var(--ok); stroke-width: 2.6; opacity: .95; }
 .corr-label { font-size: 9px; fill: var(--primary-d); }
+.corr-label.manual-label { fill: var(--ok); font-weight: 700; }
 .amb-band { fill: var(--amb); opacity: .08; }
 .amb-band-edge { stroke: var(--amb); stroke-width: 1; stroke-dasharray: 3 3; opacity: .6; }
 .unmatched-mark { stroke: var(--danger); stroke-width: 1.6; fill: none; }
