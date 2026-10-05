@@ -1,10 +1,12 @@
-"""HTTP 路由：数据 CRUD、关联计算、导出。"""
+"""HTTP 路由：数据 CRUD、关联计算、人工定案、导出。"""
 import json
 import time
+import uuid
 
 from flask import Flask, jsonify, request, send_from_directory, abort
 
 from . import db as dbmod
+from . import decisions as decmod
 from .correlator import correlate, prepare_layers
 from .domain import LITHOLOGIES, GRAINS, WATERS
 from .seed import seed_if_empty
@@ -13,23 +15,30 @@ app = Flask(__name__, static_folder="static", static_url_path="/static")
 
 
 def _load_result():
-    """最近一次关联结果（持久化，多 worker 共享）。"""
+    """最近一次关联结果（持久化，多 worker 共享），读取时合并人工定案。
+
+    原始自动主解字段（pairs / unmatched_* / 分数 / 并列计数 / 歧义区间）
+    原样保留；定案内容挂在各孔的 decision 字段与顶层 finalized_hole_ids。
+    """
     conn = dbmod.get_db()
     try:
-        row = conn.execute("SELECT payload FROM run_result WHERE id=1").fetchone()
-        return json.loads(row["payload"]) if row and row["payload"] else None
+        return decmod.load_merged(conn)
     finally:
         conn.close()
 
 
-def _save_result(result):
+def _save_result(result, run_id):
+    """写入新结果：同时清空全部旧定案（新 run 尚未有任何定案）。"""
     conn = dbmod.get_db()
     try:
+        conn.execute("DELETE FROM decision")
         conn.execute(
-            "INSERT INTO run_result (id, payload, generated_at) VALUES (1,?,?)"
+            "INSERT INTO run_result (id, payload, generated_at, run_id)"
+            " VALUES (1,?,?,?)"
             " ON CONFLICT(id) DO UPDATE SET payload=excluded.payload,"
-            " generated_at=excluded.generated_at",
-            (json.dumps(result, ensure_ascii=False), result.get("generated_at")),
+            " generated_at=excluded.generated_at, run_id=excluded.run_id",
+            (json.dumps(result, ensure_ascii=False),
+             result.get("generated_at"), run_id),
         )
         conn.commit()
     finally:
@@ -37,8 +46,14 @@ def _save_result(result):
 
 
 def _invalidate_result():
+    """失效当前结果与其全部人工定案。
+
+    层段、标志层、参数变化或重置演示数据后调用：旧定案既不再显示，
+    也不能凭旧 run_id 写回新结果（提交会得到 409）。
+    """
     conn = dbmod.get_db()
     try:
+        conn.execute("DELETE FROM decision")
         conn.execute("UPDATE run_result SET payload=NULL WHERE id=1")
         conn.commit()
     finally:
@@ -384,6 +399,8 @@ def api_settings_update():
         conn.execute("UPDATE settings SET payload=? WHERE id=1",
                      (json.dumps(cur, ensure_ascii=False),))
         conn.commit()
+        # 参数变化后旧结果口径改变：连同人工定案一并失效
+        _invalidate_result()
         return jsonify(cur)
     finally:
         conn.close()
@@ -515,7 +532,10 @@ def api_correlate():
         avg_score = round(
             sum(r["total_score"] for r in hole_results) / len(hole_results), 2
         )
+        run_id = uuid.uuid4().hex
         result = {
+            "run_id": run_id,
+            "finalized_hole_ids": [],
             "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
             "reference": {
                 "hole_id": ref_id, "hole_name": ref["name"],
@@ -538,7 +558,7 @@ def api_correlate():
             "warnings": warnings,
             "average_score": avg_score,
         }
-        _save_result(result)
+        _save_result(result, run_id)
         # 记住上次的选择，刷新页面后仍在
         settings["last_run"] = {"reference_id": ref_id,
                                 "marker_ids": result["locked_marker_ids"]}
@@ -552,6 +572,79 @@ def api_correlate():
 
 @app.get("/api/result")
 def api_result():
+    return jsonify(_load_result())
+
+
+# ---------------------------------------------------------------------------
+# 人工定案
+# ---------------------------------------------------------------------------
+
+def _dec_error(err):
+    return jsonify({"error": err.message,
+                    "stale": err.stale}), err.code
+
+
+@app.post("/api/decisions")
+def api_decisions_commit():
+    """一次提交一口或多口钻孔的人工定案（原子）。
+
+    请求体：{"run_id": <当前结果 run_id>,
+             "decisions": [{"hole_id": int, "solution_index": int}, ...]}
+    solution_index 为该孔 tie_solutions 的 0 基下标。只要任一项不属于
+    当前计算（run_id 过期、孔不存在、该孔无并列、下标越界），整次提交
+    均不生效（4xx，不写库）；全部合法才一次写入。
+    """
+    body = request.get_json(force=True, silent=True)
+    conn = dbmod.get_db()
+    try:
+        result, run_id = decmod.current_run_row(conn)
+        try:
+            parsed = decmod.parse_commit(result, run_id, body)
+        except decmod.DecisionError as e:
+            return _dec_error(e)
+        now = time.strftime("%Y-%m-%d %H:%M:%S")
+        for hole_id, idx in parsed:
+            conn.execute(
+                "INSERT INTO decision (run_id, hole_id, solution_index, decided_at)"
+                " VALUES (?,?,?,?)"
+                " ON CONFLICT(run_id, hole_id) DO UPDATE SET"
+                " solution_index=excluded.solution_index,"
+                " decided_at=excluded.decided_at",
+                (run_id, hole_id, idx, now),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+    return jsonify(_load_result())
+
+
+@app.delete("/api/decisions")
+def api_decisions_clear():
+    """清除人工定案，恢复自动主解。
+
+    请求体（可省略）：{"run_id": <当前结果 run_id>, "hole_ids": [int, ...]}
+    hole_ids 省略或为空表示清除全部定案；过期 run_id 的请求整体不生效
+    （409），不能碰到新计算的定案。
+    """
+    body = request.get_json(force=True, silent=True) or {}
+    conn = dbmod.get_db()
+    try:
+        result, run_id = decmod.current_run_row(conn)
+        try:
+            hole_ids = decmod.parse_clear(result, run_id, body)
+        except decmod.DecisionError as e:
+            return _dec_error(e)
+        if hole_ids:
+            qmarks = ",".join("?" for _ in hole_ids)
+            conn.execute(
+                f"DELETE FROM decision WHERE run_id=? AND hole_id IN ({qmarks})",
+                [run_id, *hole_ids],
+            )
+        else:
+            conn.execute("DELETE FROM decision WHERE run_id=?", (run_id,))
+        conn.commit()
+    finally:
+        conn.close()
     return jsonify(_load_result())
 
 

@@ -48,7 +48,20 @@ CREATE TABLE IF NOT EXISTS settings (
 CREATE TABLE IF NOT EXISTS run_result (
     id      INTEGER PRIMARY KEY CHECK (id = 1),
     payload TEXT,
-    generated_at TEXT
+    generated_at TEXT,
+    run_id  TEXT
+);
+
+-- 人工定案：从某次计算（run_id）列出的并列最优方案中选定的归属。
+-- 按 (run_id, hole_id) 唯一；层段/标志层/参数变化或重新计算后 run_id
+-- 失效，旧定案既不显示也不能写回新结果（见 routes._invalidate_result）。
+CREATE TABLE IF NOT EXISTS decision (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id     TEXT    NOT NULL,
+    hole_id    INTEGER NOT NULL,
+    solution_index INTEGER NOT NULL,      -- tie_solutions 中的 0 基下标
+    decided_at TEXT    NOT NULL,
+    UNIQUE (run_id, hole_id)
 );
 """
 
@@ -78,6 +91,11 @@ def init_db():
     conn = get_db()
     try:
         conn.executescript(SCHEMA)
+        # 旧库迁移：run_result 增加 run_id 列（定案归属的计算版本号）
+        cols = {r["name"] for r in
+                conn.execute("PRAGMA table_info(run_result)").fetchall()}
+        if "run_id" not in cols:
+            conn.execute("ALTER TABLE run_result ADD COLUMN run_id TEXT")
         import json
         row = conn.execute("SELECT payload FROM settings WHERE id = 1").fetchone()
         if row is None:

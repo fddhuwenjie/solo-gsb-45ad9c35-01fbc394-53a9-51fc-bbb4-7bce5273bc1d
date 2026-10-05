@@ -706,6 +706,11 @@ def correlate(ref_layers, hole_layers, anchors, weights, elev_scale,
                 "pairs": [(p["ref_layer_id"], p["hole_layer_id"]) for p in sol[0]],
                 "unmatched_ref": [u["layer_id"] for u in sol[1]],
                 "unmatched_hole": [u["layer_id"] for u in sol[2]],
+                # 完整明细：人工定案选定某条并列方案后，剖面与导出 JSON
+                # 直接按此展示，不必重跑 DP；pairs 结构与主解 pairs 一致
+                "pair_details": sol[0],
+                "unmatched_ref_details": sol[1],
+                "unmatched_hole_details": sol[2],
                 "score": round(sum(p["score"] for p in sol[0]) / denom * 100, 2),
                 "gap_count": sol[3],
             }

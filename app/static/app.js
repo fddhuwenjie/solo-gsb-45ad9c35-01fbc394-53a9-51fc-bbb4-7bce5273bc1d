@@ -123,6 +123,29 @@ function markerLabelsFor(holeId, layerId) {
 }
 
 // ---------------------------------------------------------------------------
+// 人工定案：展示视图（定案后用 decision，未定案用自动主解）
+// ---------------------------------------------------------------------------
+
+function effectiveView(h) {
+  if (h.decision) {
+    return {
+      pairs: h.decision.pairs,
+      unmatched_ref: h.decision.unmatched_ref,
+      unmatched_hole: h.decision.unmatched_hole,
+      matched_count: h.decision.matched_count,
+      gap_count: h.decision.gap_count,
+    };
+  }
+  return {
+    pairs: h.pairs,
+    unmatched_ref: h.unmatched_ref,
+    unmatched_hole: h.unmatched_hole,
+    matched_count: h.matched_count,
+    gap_count: h.gap_count,
+  };
+}
+
+// ---------------------------------------------------------------------------
 // 渲染：右栏参考孔 / 标志层 / 权重 / 结果
 // ---------------------------------------------------------------------------
 
@@ -182,44 +205,77 @@ function renderResults() {
     return;
   }
   const totalAmb = r.holes.reduce((a, h) => a + h.ambiguities.length, 0);
-  const totalGaps = r.holes.reduce((a, h) => a + h.gap_count, 0);
+  const totalGaps = r.holes.reduce((a, h) => a + (h.decision ? h.decision.gap_count : h.gap_count), 0);
   const totalSols = r.holes.reduce((a, h) => a + (h.solution_count > 1 ? 1 : 0), 0);
+  const decCount = (r.finalized_hole_ids || []).length;
+  const decLine = decCount
+    ? `<div class="dec-summary"><span class="dec-tag">✔ 人工定案 ${decCount} 孔</span>
+       <button class="small ghost" id="btnClearAllDec">全部清除，恢复自动主解</button></div>`
+    : "";
   sum.innerHTML = `
     <div><span class="score-big">${r.average_score}<small> /100 平均总分</small></span></div>
     <div class="kvgrid">
       <span>参考孔</span><b>${esc(r.reference.hole_name)}</b>
       <span>锁定标志层</span><b>${r.locked_markers.map((m) => "⚑" + esc(m.label)).join(" ") || "无"}</b>
-      <span>间隙总数</span><b>${totalGaps}</b>
+      <span>间隙总数</span><b>${totalGaps}${decCount ? "（按定案展示）" : ""}</b>
       <span>歧义层位</span><b>${totalAmb} 处${totalSols ? `（${totalSols} 孔存在并列最优）` : ""}</b>
     </div>
+    ${decLine}
     ${r.warnings.length ? r.warnings.map((w) => `<div class="tag warn">⚠ ${esc(w)}</div>`).join("") : ""}
     <small>${esc(r.generated_at)}</small>`;
+  if (decCount) $("#btnClearAllDec").onclick = () => clearDecisions([]);
 
   holes.innerHTML = r.holes.map((h, hi) => {
+    const dec = h.decision || null;
+    const eff = effectiveView(h);
     const ambTags = h.ambiguities.map((a) =>
       `<span class="tag amb">参考层${a.ref_seq}→{${[
         ...a.partners.map((p) => p.seq),
         ...(a.can_be_unmatched ? ["未匹配"] : []),
       ].join("/")}} · 跨${a.elev_span}m</span>`).join("");
-    const unref = h.unmatched_ref.map((u) => `<span class="tag unm">参考${u.seq} ${esc(u.lithology)}</span>`).join("");
-    const unhole = h.unmatched_hole.map((u) => `<span class="tag unm">本孔${u.seq} ${esc(u.lithology)}</span>`).join("");
+    const unref = eff.unmatched_ref.map((u) => `<span class="tag unm">参考${u.seq} ${esc(u.lithology)}</span>`).join("");
+    const unhole = eff.unmatched_hole.map((u) => `<span class="tag unm">本孔${u.seq} ${esc(u.lithology)}</span>`).join("");
     const tie = h.solution_count > 1
       ? `<div class="line"><span class="linkbtn" data-ties="${hi}">查看 ${h.solution_count >= 9999 ? "≥9999" : h.solution_count} 条并列最优解（列出前 ${h.solutions_listed} 条）</span></div>`
       : '<div class="line"><small>✔ 唯一最优解</small></div>';
-    return `<div class="result-hole">
+    const sigOf = (pairs, ur, uh) => JSON.stringify([
+      pairs.map((p) => [p.ref_layer_id, p.hole_layer_id]).sort(),
+      ur.map((u) => u.layer_id).sort(),
+      uh.map((u) => u.layer_id).sort(),
+    ]);
+    const sameAsAuto = dec
+      ? sigOf(dec.pairs, dec.unmatched_ref, dec.unmatched_hole)
+        === sigOf(h.pairs, h.unmatched_ref, h.unmatched_hole)
+      : true;
+    const banner = dec
+      ? `<div class="decided-bar">
+           <span class="dec-tag">✔ 人工定案</span>
+           <small>选定方案 #${dec.solution_index + 1}（定案时间 ${esc(dec.decided_at)}）；与自动主解${sameAsAuto ? "归属相同" : "<b>归属不同</b>，自动主解仍保留在并列解弹窗（标注「自动主解」）与导出 JSON"}；算法分数、并列计数、歧义区间不因定案改写</small>
+           <button class="small dec-clear" data-clear-hole="${h.hole_id}">清除定案</button>
+         </div>`
+      : (h.solution_count > 1
+        ? '<div class="line"><small class="auto-note">当前显示：自动主解（匹配优先）。可在并列解弹窗中人工定案。</small></div>'
+        : "");
+    const autoKeys = new Set(h.pairs.map((p) => `${p.ref_layer_id}-${p.hole_layer_id}`));
+    return `<div class="result-hole${dec ? " decided" : ""}">
       <div class="result-hole-head">${esc(h.hole_name)}<span class="sc">${h.total_score} 分</span></div>
       <div class="result-hole-body">
-        <div class="line">匹配 ${h.matched_count} 层 · 间隙 ${h.gap_count} 处
+        ${banner}
+        <div class="line">匹配 ${eff.matched_count} 层 · 间隙 ${eff.gap_count} 处
+          ${eff.pairs.filter((p) => !p.marker).map((p) => `<span class="tag${dec && !autoKeys.has(`${p.ref_layer_id}-${p.hole_layer_id}`) ? " dec-match" : ""}">参考${p.ref_seq}→${p.hole_seq}</span>`).join("")}
           ${h.anchors.map((a) => `<span class="tag" style="background:#fbe7d3;color:#a35a14">⚑锚 参考${a.ref_seq}↔${a.hole_seq} (${a.score.toFixed(2)})</span>`).join("")}</div>
         ${ambTags ? `<div class="line">${ambTags}</div>` : ""}
-        ${unref ? `<div class="line">未匹配参考层：${unref}</div>` : ""}
-        ${unhole ? `<div class="line">未匹配本孔层：${unhole}</div>` : ""}
+        ${unref ? `<div class="line">${dec ? "<b>定案下</b>" : ""}未匹配参考层：${unref}</div>` : ""}
+        ${unhole ? `<div class="line">${dec ? "<b>定案下</b>" : ""}未匹配本孔层：${unhole}</div>` : ""}
         ${tie}
       </div>
     </div>`;
   }).join("");
   holes.querySelectorAll("[data-ties]").forEach((b) => {
     b.onclick = () => openTiesModal(r.holes[Number(b.dataset.ties)]);
+  });
+  holes.querySelectorAll(".dec-clear").forEach((b) => {
+    b.onclick = () => clearDecisions([Number(b.dataset.clearHole)]);
   });
 }
 
@@ -345,13 +401,13 @@ function drawSection() {
     });
   });
 
-  // 未匹配标记
+  // 未匹配标记（定案孔按定案归属展示）
   r.holes.forEach((h) => {
     const cx = cxOf[h.hole_id];
-    h.unmatched_hole.forEach((u) => { drawCross(svg, cx, yOf(u.zmid)); });
+    effectiveView(h).unmatched_hole.forEach((u) => { drawCross(svg, cx, yOf(u.zmid)); });
   });
   const rcx = cxOf[r.reference.hole_id];
-  new Set(r.holes.flatMap((h) => h.unmatched_ref.map((u) => u.layer_id))).forEach((lid) => {
+  new Set(r.holes.flatMap((h) => effectiveView(h).unmatched_ref.map((u) => u.layer_id))).forEach((lid) => {
     const l = r.reference.layers_geo.find((x) => x.id === lid);
     if (l) drawCross(svg, rcx, yOf(l.zmid));
   });
@@ -364,13 +420,14 @@ function drawSection() {
   const layerPos = {};
   cols.forEach((c) => c.layers.forEach((l) => { layerPos[l.id] = { cx: cxOf[c.id], l }; }));
 
-  // 候选替代连线（歧义，浅色虚线）
+  // 候选替代连线（歧义，浅色虚线）；已被定案选中的候选不再画浅色虚线
   if (showAmb) {
     r.holes.forEach((h) => {
+      const eff = effectiveView(h);
       h.ambiguities.forEach((a) => {
         const p1 = layerPos[a.ref_layer_id];
         a.partners.forEach((p) => {
-          const chosen = h.pairs.find((pr) => pr.ref_layer_id === a.ref_layer_id
+          const chosen = eff.pairs.find((pr) => pr.ref_layer_id === a.ref_layer_id
             && pr.hole_layer_id === p.layer_id);
           if (chosen) return;
           const p2 = layerPos[p.layer_id];
@@ -382,22 +439,30 @@ function drawSection() {
     });
   }
 
-  // 主匹配连线
+  // 匹配连线：人工定案为绿色实线，其余沿用主解线型
   const showScores = $("#chkScores").checked;
   r.holes.forEach((h) => {
     const ambH = ambMap[h.hole_id] || {};
-    h.pairs.forEach((p) => {
+    const dec = h.decision;
+    const autoKeys = new Set(h.pairs.map((p) => `${p.ref_layer_id}-${p.hole_layer_id}`));
+    effectiveView(h).pairs.forEach((p) => {
       const p1 = layerPos[p.ref_layer_id], p2 = layerPos[p.hole_layer_id];
       if (!p1 || !p2) return;
       const ambiguous = !!ambH[p.ref_layer_id];
+      const changedByDecision = dec
+        && !autoKeys.has(`${p.ref_layer_id}-${p.hole_layer_id}`);
+      const cls = "corr-line" + (p.marker ? " anchor"
+        : changedByDecision ? " decided"
+        : ambiguous ? " ambiguous" : "");
       el("line", {
         x1: p1.cx, y1: yOf(p.ref_zm), x2: p2.cx, y2: yOf(p.hole_zm),
-        class: "corr-line" + (p.marker ? " anchor" : ambiguous ? " ambiguous" : ""),
+        class: cls,
       }, svg);
       if (showScores && Math.abs(p2.cx - p1.cx) > 90) {
         const t = el("text", {
           x: (p1.cx + p2.cx) / 2, y: (yOf(p.ref_zm) + yOf(p.hole_zm)) / 2 - 2,
-          "text-anchor": "middle", class: "corr-label",
+          "text-anchor": "middle", class: "corr-label"
+            + (changedByDecision ? " corr-label-dec" : ""),
         }, svg);
         t.textContent = p.score.toFixed(2);
       }
@@ -415,7 +480,8 @@ function drawCross(svg, cx, cy) {
 
 function renderLegend() {
   $("#legend").innerHTML = `
-    <span class="item"><i class="ln" style="border-color:var(--primary)"></i>匹配连线（数字为相似度）</span>
+    <span class="item"><i class="ln" style="border-color:var(--primary)"></i>自动主解匹配连线（数字为相似度）</span>
+    <span class="item"><i class="ln" style="border-color:var(--ok)"></i>人工定案匹配连线</span>
     <span class="item"><i class="ln" style="border-color:var(--accent)"></i>锁定标志层强制对齐</span>
     <span class="item"><i class="ln" style="border-color:var(--amb);border-top-style:dashed"></i>歧义候选 / 歧义带</span>
     <span class="item"><svg width="12" height="12"><line x1="1" y1="1" x2="11" y2="11" class="unmatched-mark"/><line x1="1" y1="11" x2="11" y2="1" class="unmatched-mark"/></svg>未匹配层（间隙）</span>
@@ -575,28 +641,154 @@ $("#btnDeleteMarker").onclick = async () => {
 };
 
 // ---------------------------------------------------------------------------
-// 并列解弹窗
+// 并列解弹窗 / 人工定案
 // ---------------------------------------------------------------------------
+
+const pendingDecisions = new Map();   // holeId -> solutionIndex（待提交清单）
+
+function pendingKey(h, i) {
+  return `${h.hole_id}:${i}`;
+}
+
+function renderPendingBar() {
+  const bar = $("#tiesPending");
+  if (!pendingDecisions.size) {
+    bar.hidden = true;
+    bar.innerHTML = "";
+    return;
+  }
+  const items = [];
+  pendingDecisions.forEach((idx, holeId) => {
+    const h = state.result.holes.find((x) => x.hole_id === holeId);
+    items.push(`<span class="pend-item">${esc(h.hole_name)}→方案 #${idx + 1}
+      <button class="pend-rm" data-rm-hole="${holeId}">✕</button></span>`);
+  });
+  bar.innerHTML =
+    `<div class="pend-head"><b>待提交定案（${pendingDecisions.size} 孔，一次提交；任一非法则整批不生效）</b></div>
+     <div class="pend-list">${items.join("")}</div>
+     <div class="pend-actions">
+       <button class="small ghost" id="btnPendingClear">清空清单</button>
+       <button class="small primary" id="btnPendingSubmit">一次提交定案</button>
+     </div>`;
+  bar.hidden = false;
+  bar.querySelectorAll(".pend-rm").forEach((b) => {
+    b.onclick = () => { pendingDecisions.delete(Number(b.dataset.rmHole)); renderPendingBar(); };
+  });
+  $("#btnPendingClear").onclick = () => {
+    pendingDecisions.clear();
+    renderPendingBar();
+    $$("#tiesBody .tie-item").forEach((el) => el.classList.remove("picked"));
+  };
+  $("#btnPendingSubmit").onclick = commitDecisions;
+}
+
+async function commitDecisions() {
+  if (!state.result || !state.result.run_id) return;
+  const decisions = Array.from(pendingDecisions, ([hole_id, solution_index]) =>
+    ({ hole_id, solution_index }));
+  try {
+    const merged = await api("POST", "/api/decisions", {
+      run_id: state.result.run_id, decisions,
+    });
+    pendingDecisions.clear();
+    state.result = merged;
+    $("#tiesModal").hidden = true;
+    renderResults();
+    drawSection();
+    toast(`已为 ${merged.finalized_hole_ids.length} 孔定案`, "ok");
+  } catch (e) {
+    if (e.message) toast(e.message, "err");
+    if (/过期|重新计算/.test(e.message)) await reloadStaleResult();
+  }
+}
+
+async function reloadStaleResult() {
+  // 过期页面：拉取最新结果（旧定案已不显示/不能写回），再重绘
+  const s = await api("GET", "/api/state");
+  state.result = s.result;
+  pendingDecisions.clear();
+  renderResults();
+  drawSection();
+}
+
+async function clearDecisions(holeIds) {
+  if (!state.result || !state.result.run_id) return;
+  const msg = holeIds.length ? "确认清除该孔的人工定案、恢复自动主解？"
+    : "确认清除全部人工定案、各孔恢复自动主解？";
+  if (!confirm(msg)) return;
+  try {
+    const merged = await api("DELETE", "/api/decisions", {
+      run_id: state.result.run_id, hole_ids: holeIds,
+    });
+    state.result = merged;
+    renderResults();
+    drawSection();
+    toast(holeIds.length ? "已清除该孔定案" : "已清除全部定案", "ok");
+  } catch (e) {
+    toast(e.message, "err");
+    if (/过期|重新计算/.test(e.message)) await reloadStaleResult();
+  }
+}
 
 function openTiesModal(h) {
   const refName = state.result.reference.hole_name;
+  const currentIdx = h.decision ? h.decision.solution_index : null;
+  const autoKey = (s) => JSON.stringify([
+    [...s.pairs].sort(),
+    [...s.unmatched_ref].sort(),
+    [...s.unmatched_hole].sort(),
+  ]);
+  const autoSig = autoKey({
+    pairs: h.pairs.map((p) => [p.ref_layer_id, p.hole_layer_id]),
+    unmatched_ref: h.unmatched_ref.map((u) => u.layer_id),
+    unmatched_hole: h.unmatched_hole.map((u) => u.layer_id),
+  });
+  if (!pendingDecisions.has(h.hole_id)) {
+    if (currentIdx !== null) pendingDecisions.set(h.hole_id, currentIdx);
+  }
   $("#tiesBody").innerHTML =
-    `<p class="hint">${esc(h.hole_name)} 相对参考孔 ${esc(refName)} 存在 ${h.solution_count >= 9999 ? "≥9999" : h.solution_count} 条总分相同的最优关联方案（DP 间隙惩罚相同），以下列出前 ${h.solutions_listed} 条。橙色为锁定标志层。</p>`
+    `<p class="hint">${esc(h.hole_name)} 相对参考孔 ${esc(refName)} 存在 ${h.solution_count >= 9999 ? "≥9999" : h.solution_count} 条总分相同的最优关联方案（DP 间隙惩罚相同），以下列出前 ${h.solutions_listed} 条。橙色为锁定标志层。点「采用为定案」可把方案加入待提交清单，可继续切换到其他并列孔后一次提交；定案不改写算法分数、并列计数与歧义区间。</p>`
     + h.tie_solutions.map((s, i) => {
       const refLayer = (id) => state.result.reference.layers_geo.find((l) => l.id === id);
       const holeLayer = (id) => h.layers_geo.find((l) => l.id === id);
+      const isAuto = autoKey(s) === autoSig;
+      const isDecided = currentIdx === i;
       const pairHtml = s.pairs.map(([rid, hid]) => {
         const a = refLayer(rid), b = holeLayer(hid);
-        const isAnchor = h.pairs.find((p) => p.marker && p.ref_layer_id === rid && p.hole_layer_id === hid);
+        const isAnchor = h.anchors.some((p) =>
+          p.ref_layer_id === rid && p.hole_layer_id === hid);
         return `<span class="tie-pill ${isAnchor ? "anchor" : ""}">${a?.seq}→${b?.seq}</span>`;
       }).join("");
-      return `<div class="tie-item">
-        <div class="th"><span>方案 ${i + 1}</span><span>${s.score} 分 · 间隙 ${s.gap_count}</span></div>
+      const marks = [
+        isAuto ? '<span class="sol-badge auto">自动主解</span>' : "",
+        isDecided ? '<span class="sol-badge dec">当前定案</span>' : "",
+      ].join("");
+      return `<div class="tie-item${pendingDecisions.get(h.hole_id) === i ? " picked" : ""}" data-sol="${i}">
+        <div class="th"><span>方案 ${i + 1} ${marks}</span><span>${s.score} 分 · 间隙 ${s.gap_count}</span></div>
         <div class="pairs">${pairHtml}</div>
         ${s.unmatched_ref.length ? `<div class="un">未匹配参考层：${s.unmatched_ref.map((id) => refLayer(id)?.seq).join(", ")}</div>` : ""}
         ${s.unmatched_hole.length ? `<div class="un">未匹配本孔层：${s.unmatched_hole.map((id) => holeLayer(id)?.seq).join(", ")}</div>` : ""}
+        <div class="decide-row">
+          <button class="small decide-btn" data-pick="${i}">采用为定案</button>
+          ${isDecided ? '<button class="small ghost decide-clear" data-clear="">清除该孔定案</button>' : ""}
+        </div>
       </div>`;
     }).join("");
+  $$("#tiesBody .decide-btn").forEach((b) => {
+    b.onclick = () => {
+      const i = Number(b.dataset.pick);
+      pendingDecisions.set(h.hole_id, i);
+      $$("#tiesBody .tie-item").forEach((el) =>
+        el.classList.toggle("picked", Number(el.dataset.sol) === i));
+      renderPendingBar();
+    };
+  });
+  const clr = $("#tiesBody .decide-clear");
+  if (clr) clr.onclick = async () => {
+    $("#tiesModal").hidden = true;
+    await clearDecisions([h.hole_id]);
+  };
+  renderPendingBar();
   $("#tiesModal").hidden = false;
 }
 
@@ -607,6 +799,7 @@ function openTiesModal(h) {
 async function recalc() {
   if (!state.ui.referenceId) { toast("请先选择参考孔", "err"); return; }
   try {
+    pendingDecisions.clear();
     state.result = await api("POST", "/api/correlate", {
       reference_id: state.ui.referenceId,
       marker_ids: Array.from(state.ui.locked),
@@ -624,6 +817,7 @@ async function refreshAfterEdit(msg) {
   state.markers = s.markers;
   state.settings = s.settings;
   state.result = s.result;
+  pendingDecisions.clear();
   renderAll();
   if (msg) toast(msg, "ok");
 }

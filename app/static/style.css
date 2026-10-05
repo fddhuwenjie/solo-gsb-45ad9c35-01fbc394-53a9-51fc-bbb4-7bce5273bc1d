@@ -167,6 +167,41 @@ button:disabled { opacity: .45; cursor: not-allowed; }
 .result-hole-body .line { margin: 3px 0; }
 .linkbtn { color: var(--primary); cursor: pointer; text-decoration: underline; }
 
+/* 人工定案 */
+.result-hole.decided { border-color: var(--ok); box-shadow: 0 0 0 1px var(--ok) inset; }
+.decided-bar {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  background: #eaf6ef; border: 1px solid #b9dfc8; border-radius: 6px;
+  padding: 5px 8px; margin-bottom: 6px;
+}
+.decided-bar small { font-size: 11px; color: #35684a; flex: 1 1 200px; }
+.dec-tag {
+  background: var(--ok); color: #fff; font-size: 10.5px; font-weight: 600;
+  padding: 1px 8px; border-radius: 8px; white-space: nowrap;
+}
+.dec-summary { display: flex; align-items: center; gap: 8px; margin: 4px 0 8px; }
+.auto-note { color: var(--ink-2); }
+.tag.dec-match { background: #eaf6ef; color: var(--ok); font-weight: 600; }
+.sol-badge {
+  font-size: 10px; font-weight: 600; border-radius: 8px; padding: 0 7px; margin-left: 4px;
+}
+.sol-badge.auto { background: #eef4f6; color: var(--primary-d); }
+.sol-badge.dec { background: var(--ok); color: #fff; }
+.decide-row { margin-top: 6px; display: flex; gap: 8px; }
+.tie-item.picked { border-color: var(--ok); box-shadow: 0 0 0 1px var(--ok) inset; background: #f6fcf8; }
+.ties-pending {
+  border: 1px solid var(--ok); background: #f6fcf8; border-radius: 7px;
+  padding: 8px 10px; margin-bottom: 12px; font-size: 12.5px;
+}
+.pend-head b { color: #2c6b47; }
+.pend-list { display: flex; flex-wrap: wrap; gap: 6px; margin: 6px 0; }
+.pend-item {
+  background: #fff; border: 1px solid #b9dfc8; border-radius: 6px;
+  padding: 2px 6px 2px 9px; font-size: 12px;
+}
+.pend-rm { border: none; background: none; color: var(--danger); cursor: pointer; font-size: 12px; padding: 0 2px; }
+.pend-actions { display: flex; justify-content: flex-end; gap: 8px; }
+
 /* ---------- 弹窗 ---------- */
 .modal-mask {
   position: fixed; inset: 0; background: rgba(20,35,45,.42);
@@ -235,8 +270,10 @@ button:disabled { opacity: .45; cursor: not-allowed; }
 .layer-label { font-size: 9.5px; fill: #2c363d; pointer-events: none; }
 .corr-line { fill: none; stroke: var(--primary); stroke-width: 1.6; opacity: .85; }
 .corr-line.anchor { stroke: var(--accent); stroke-width: 2.4; }
+.corr-line.decided { stroke: var(--ok); stroke-width: 2.6; opacity: .95; }
 .corr-line.ambiguous { stroke: var(--amb); stroke-dasharray: 5 3; stroke-width: 1.8; }
 .corr-label { font-size: 9px; fill: var(--primary-d); }
+.corr-label-dec { fill: var(--ok); font-weight: 700; }
 .amb-band { fill: var(--amb); opacity: .08; }
 .amb-band-edge { stroke: var(--amb); stroke-width: 1; stroke-dasharray: 3 3; opacity: .6; }
 .unmatched-mark { stroke: var(--danger); stroke-width: 1.6; fill: none; }

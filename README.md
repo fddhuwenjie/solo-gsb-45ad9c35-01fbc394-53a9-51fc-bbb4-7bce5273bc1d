@@ -33,7 +33,8 @@ python wsgi.py          # http://localhost:8000
 `gap_open=1e20`、`gap_extend=9.99999999999e19`（真实分差仅 3052 个浮点
 ULP）下 3×1 仍只算首/末层两个归属”两类伪并列反例，以及大数值真并列
 （含锁定标志层、多段组合）保留、容差边界和多标志层分段锚点组合用例；
-另含三个端到端 HTTP 用例，无 Flask 时自动跳过）：
+另有人工定案的原子提交、过期 409、失效/持久化与导出区分用例；
+含多个端到端 HTTP 用例，无 Flask 时自动跳过）：
 
 ```bash
 python3 -m unittest discover -s tests -v
@@ -191,6 +192,84 @@ curl -s -XPOST $BASE/api/correlate -H 'Content-Type: application/json' \
 # 期望：solution_count = 6，含一个 pairs=[]、unref=[1,2]、unhole=[1,2] 的“全部未匹配”归属
 ```
 
+### 人工定案与过期提交（可执行示例）
+
+下面的示例使用**内置演示数据**：默认参数下 ZK04 相对参考孔 ZK01 在 M1–L1
+之间存在一对高程对称的分叉砂岩层（第 7、8 层），`solution_count=2`，自动主解
+取其中之一，可人工定案为另一条。定案接口为
+`POST /api/decisions`，请求体 `{"run_id", "decisions":[{"hole_id","solution_index"}]}`，
+`solution_index` 是该孔 `tie_solutions` 的 **0 基下标**；多孔可一次提交，原子生效。
+
+```bash
+docker compose up -d --build
+BASE=http://localhost:8000
+
+read RID MID LID <<EOF2
+$(curl -s $BASE/api/state | python3 -c '
+import sys,json
+s=json.load(sys.stdin)
+rid=next(b["id"] for b in s["boreholes"] if b["name"]=="ZK01")
+mids={m["label"]:m["id"] for m in s["markers"]}
+print(rid,mids["M1"],mids["L1"])')
+EOF2
+
+# 1) 计算（锁定 M1/L1，触发 ZK04 的天然并列），记录 run_id
+RUN=$(curl -s -XPOST $BASE/api/correlate -H 'Content-Type: application/json' \
+  -d "{\"reference_id\":$RID,\"marker_ids\":[$MID,$LID]}")
+RUN_ID=$(echo "$RUN" | python3 -c 'import sys,json;print(json.load(sys.stdin)["run_id"])')
+HID=$(echo "$RUN" | python3 -c 'import sys,json;print(next(h["hole_id"] for h in json.load(sys.stdin)["holes"] if h["hole_name"]=="ZK04"))')
+echo "run_id=$RUN_ID hole=$HID"
+
+# 2) 定案：选择并列方案 #2（下标 1）。刷新页面 / 重启容器后仍保留
+curl -s -XPOST $BASE/api/decisions -H 'Content-Type: application/json' \
+  -d "{\"run_id\":\"$RUN_ID\",\"decisions\":[{\"hole_id\":$HID,\"solution_index\":1}]}" \
+| python3 -c 'import sys,json;r=json.load(sys.stdin);h=next(x for x in r["holes"] if x["hole_name"]==r["finalized_hole_ids"][0]);print("已定案孔:",r["finalized_hole_ids"],"| 方案下标:",h["decision"]["solution_index"],"| 定案匹配:",[(p["ref_seq"],p["hole_seq"]) for p in h["decision"]["pairs"]]);print("自动主解仍在 pairs:",[(p["ref_seq"],p["hole_seq"]) for p in h["pairs"]],"| solution_count 未改写:",h["solution_count"])'
+# 期望：已定案孔: [<ZK04 id>] | 方案下标: 1 | 定案匹配: [..., (7, 8)]（分叉层改为另一归属）
+#       自动主解仍在 pairs: [...] | solution_count 未改写: 2
+
+# 3) 持久化：直接 GET /api/result（或刷新浏览器、docker compose restart 后）
+curl -s $BASE/api/result | python3 -c 'import sys,json;r=json.load(sys.stdin);print("刷新后 finalized_hole_ids:",r["finalized_hole_ids"])'
+# 期望：刷新后 finalized_hole_ids: [<ZK04 id>]
+
+# 4) 清除该孔定案，恢复自动主解（省略 "hole_ids" 则清除全部孔）
+curl -s -XDELETE $BASE/api/decisions -H 'Content-Type: application/json' \
+  -d "{\"run_id\":\"$RUN_ID\",\"hole_ids\":[$HID]}" \
+| python3 -c 'import sys,json;print("清除后 finalized_hole_ids:",json.load(sys.stdin)["finalized_hole_ids"])'
+# 期望：清除后 finalized_hole_ids: []
+```
+
+**多孔一次提交的原子性**：请求体的 `decisions` 可含多口孔；任一项非法（孔不在
+本次结果、该孔无并列、下标越界等）服务端返回 400 且**一项都不写入**：
+
+```bash
+# 前两项合法、第三项孔 id 不存在 -> 整批不生效
+curl -s -o /dev/null -w '%{http_code}\n' -XPOST $BASE/api/decisions \
+  -H 'Content-Type: application/json' \
+  -d "{\"run_id\":\"$RUN_ID\",\"decisions\":[{\"hole_id\":$HID,\"solution_index\":0},{\"hole_id\":999999,\"solution_index\":0}]}"
+# 期望：400，且 GET /api/result 的 finalized_hole_ids 仍为 []
+```
+
+**过期提交（重新计算 / 改层段 / 改参数后）**：任一使结果口径变化的操作都会生成
+新 `run_id` 并清空旧定案；仍旧开着的页面拿着旧 `run_id` 提交会被拒绝（409
+`stale:true`），旧定案不会显示、也写不回新结果：
+
+```bash
+# 5) 先定案，再重新计算（新 run_id，旧定案自动清空）
+curl -s -XPOST $BASE/api/decisions -H 'Content-Type: application/json' \
+  -d "{\"run_id\":\"$RUN_ID\",\"decisions\":[{\"hole_id\":$HID,\"solution_index\":1}]}" >/dev/null
+NEW=$(curl -s -XPOST $BASE/api/correlate -H 'Content-Type: application/json' \
+  -d "{\"reference_id\":$RID,\"marker_ids\":[$MID,$LID]}")
+echo "$NEW" | python3 -c 'import sys,json;r=json.load(sys.stdin);print("新 run:",r["run_id"][:8],"... 定案孔:",r["finalized_hole_ids"])'
+# 期望：新 run: xxxxxxxx ... 定案孔: []
+
+# 6) 过期页面用旧 run_id 提交 -> 409 stale，不会污染新结果
+curl -s -o /tmp/stale.json -w '%{http_code}\n' -XPOST $BASE/api/decisions \
+  -H 'Content-Type: application/json' \
+  -d "{\"run_id\":\"$RUN_ID\",\"decisions\":[{\"hole_id\":$HID,\"solution_index\":1}]}"
+# 期望：409
+cat /tmp/stale.json   # {"error": "该操作来自已过期的计算结果，请重新计算后再定案", "stale": true}
+```
+
 ## 功能
 
 - **数据录入**：多口钻孔的孔口高程、水平位置（剖面坐标），以及按深度排列的岩性层段
@@ -221,6 +300,20 @@ curl -s -XPOST $BASE/api/correlate -H 'Content-Type: application/json' \
     `solution_count` 与 `solutions_listed` 口径一致（支持 `gap_open < gap_extend`、
     惩罚取值任意大等接口允许的全部非负惩罚组合）；
   - 并列解计数封顶 9999，并列方案枚举最多列出前 100 条，可在结果区弹窗逐方案查看。
+- **人工定案（并列最优归属选定）**：
+  - 某孔存在并列最优时，可在并列解弹窗把任一条列出方案「采用为定案」；可连续切换到
+    其他并列孔、把多口孔的选择加入清单后**一次提交**——只要其中任一选择不属于当前
+    计算（过期结果、孔不在本次结果、该孔无并列、方案下标越界），**整次提交均不生效**
+    （400；过期 `run_id` 为 409），服务端在全部校验通过后才写库；
+  - 剖面图与导出 JSON 显示**定案后的匹配对与未匹配层**：人工定案连线为绿色实线，
+    未匹配红叉随定案归属变化；自动主解字段（`pairs` / `unmatched_*`）与算法指标
+    （`total_score` / `dp_score` / `solution_count` / `solutions_listed` /
+    `ambiguities`）**原样保留、不因定案改写**，定案内容挂在每孔 `decision` 字段，
+    顶层 `finalized_hole_ids` 列出已定案孔；未定案孔仍按自动主解展示；
+  - 定案持久化在 SQLite（`decision` 表，按 `run_id` 归属），**刷新页面、重启容器后
+    保留**；层段、标志层、参数变化或重新计算会生成新 `run_id` 并清空旧定案——旧定案
+    不再显示，过期页面也无法凭旧 `run_id` 把它写回新结果（提交得到 409  stale）；
+  - 提供「清除定案」（单孔或全部）恢复自动主解。
 - **剖面图**：SVG 绘制统一高程的钻孔柱状，连线颜色区分普通匹配 / 标志层锚点 / 歧义候选，
   未匹配层标红叉，悬停层块查看属性，可开关歧义带与相似度标注。
 - **重算与导出**：随时调整五项权重、高程特征尺度和间隙惩罚后重算；
@@ -246,10 +339,12 @@ curl -s -XPOST $BASE/api/correlate -H 'Content-Type: application/json' \
 | GET | `/api/config` | 岩性、粒径、含水状态字典与默认参数 |
 | POST/PUT/DELETE | `/api/boreholes[/:id]` | 钻孔与层段 CRUD（层段随孔整体保存） |
 | POST/PUT/DELETE | `/api/markers[/:id]` | 标志层及各孔层链接 CRUD |
-| PUT | `/api/settings` | 权重、高程尺度、间隙惩罚 |
-| POST | `/api/correlate` | `{reference_id, marker_ids}` 触发关联计算 |
-| GET | `/api/export` | 下载 JSON 归档 |
-| POST | `/api/demo/reset` | 恢复内置演示数据 |
+| PUT | `/api/settings` | 权重、高程尺度、间隙惩罚（保存后旧结果与定案失效） |
+| POST | `/api/correlate` | `{reference_id, marker_ids}` 触发关联计算（生成新 `run_id`，旧定案清空） |
+| POST | `/api/decisions` | 一次提交一口或多口孔的人工定案（原子，见下） |
+| DELETE | `/api/decisions` | 清除定案（单孔或全部），恢复自动主解 |
+| GET | `/api/export` | 下载 JSON 归档（自动主解与人工定案分列） |
+| POST | `/api/demo/reset` | 恢复内置演示数据（旧结果与定案一并清除） |
 
 ## 目录结构
 
@@ -258,10 +353,11 @@ app/
   db.py           SQLite 建表 / 默认参数
   domain.py       岩性族字典、属性相似度
   correlator.py   三态 DP、标志层分段、正反表歧义判定、并列解枚举
+  decisions.py    人工定案的原子校验与结果合并（不依赖 Flask）
   seed.py         内置演示数据
-  routes.py       Flask 路由
+  routes.py       Flask 路由（含 /api/decisions 定案提交/清除）
   static/         index.html / style.css / app.js（原生前端，SVG 剖面）
-tests/            并列解计数口径回归测试（unittest，无需 Flask）
+tests/            并列解计数口径与人工定案回归测试（unittest，无 Flask 时跳过 HTTP 用例）
 wsgi.py           开发入口 & gunicorn 入口
 Dockerfile / docker-compose.yml
 ```
@@ -287,6 +383,35 @@ Dockerfile / docker-compose.yml
                     "elev_min": 61.2, "elev_max": 64.8, "elev_span": 3.6 }],
   "solution_count": 1,
   "solutions_listed": 1,
-  "tie_solutions": [ /* 并列方案：匹配对 id、未匹配层 id、各自总分 */ ]
+  "tie_solutions": [ /* 并列方案：匹配对 id、未匹配层 id、各自总分，
+                        另含 pair_details / unmatched_*_details 完整明细 */ ],
+  "decision": null
+}
+```
+
+存在并列最优并已人工定案时，顶层带 `"run_id"` 与 `"finalized_hole_ids"`，
+对应孔额外出现 `decision`（自动主解字段保持不变）：
+
+```json
+{
+  "run_id": "9f1c…",
+  "finalized_hole_ids": [4],
+  "holes": [{
+    "hole_name": "ZK04",
+    "pairs": [ /* …自动主解，原样保留… */ ],
+    "solution_count": 2, "solutions_listed": 2,
+    "ambiguities": [ /* …算法歧义区间，原样保留… */ ],
+    "decision": {
+      "source": "manual",
+      "run_id": "9f1c…",
+      "hole_id": 4,
+      "solution_index": 1,          // 选定 tie_solutions 的 0 基下标
+      "decided_at": "2026-10-05 14:23:11",
+      "pairs": [ /* 定案匹配对，结构与主解 pairs 相同 */ ],
+      "unmatched_ref": [ /* 定案下未匹配参考层（完整明细） */ ],
+      "unmatched_hole": [ /* 定案下未匹配本孔层（完整明细） */ ],
+      "score": 0.0, "gap_count": 1, "matched_count": 9
+    }
+  }]
 }
 ```
